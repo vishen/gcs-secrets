@@ -1,0 +1,5 @@
+- Should we overwrite data if key already exists?
+	- Maybe add a --force?
+- Write message from file
+- take all arguments as env file?
+	- There are quite a lot of arguments required...
