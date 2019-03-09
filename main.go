@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	cloudkms "cloud.google.com/go/kms/apiv1"
 	"google.golang.org/api/iterator"
@@ -29,21 +31,30 @@ var (
 	kmsClient     *cloudkms.KeyManagementClient
 
 	validationError = "missing or empty required field %s"
+
+	defaultTimeout = time.Second * 15
 )
+
+func getFromEnv(val *string, envName string) string {
+	if *val == "" {
+		*val = os.Getenv(envName)
+	}
+	return *val
+}
 
 func validateFlags() error {
 	switch "" {
-	case *kmsProjectID:
+	case getFromEnv(kmsProjectID, "GCS_SECRETS_KMS_PROJECT_ID"):
 		return fmt.Errorf(validationError, "-kms-project-id")
-	case *kmsRegion:
+	case getFromEnv(kmsRegion, "GCS_SECRETS_KMS_REGION"):
 		return fmt.Errorf(validationError, "-kms-region")
-	case *kmsKeyRing:
+	case getFromEnv(kmsKeyRing, "GCS_SECRETS_KMS_KEYRING"):
 		return fmt.Errorf(validationError, "-kms-key-ring")
-	case *kmsKey:
+	case getFromEnv(kmsKey, "GCS_SECRETS_KMS_KEY"):
 		return fmt.Errorf(validationError, "-kms-key")
-	case *gcsBucket:
+	case getFromEnv(gcsBucket, "GCS_SECRETS_GCS_BUSKET"):
 		return fmt.Errorf(validationError, "-gcs-bucket")
-	case *gcsPrefix:
+	case getFromEnv(gcsPrefix, "GCS_SECRETS_GCS_PREFIX"):
 		return fmt.Errorf(validationError, "-gcs-prefix")
 	}
 	return nil
@@ -68,12 +79,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := initialiseClients(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	if err := initialiseClients(ctx); err != nil {
 		log.Fatal(err)
 	}
 
-	// TODO: Add timeout
-	ctx := context.Background()
 	switch cmd {
 	case "get":
 		if len(args) != 2 {
@@ -102,10 +114,7 @@ func main() {
 	}
 }
 
-func initialiseClients() error {
-	// TODO: Add timeout
-	ctx := context.Background()
-
+func initialiseClients(ctx context.Context) error {
 	var err error
 	kmsClient, err = cloudkms.NewKeyManagementClient(ctx)
 	if err != nil {
