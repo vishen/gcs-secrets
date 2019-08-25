@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"text/template"
 	"time"
 
 	cloudkms "cloud.google.com/go/kms/apiv1"
@@ -26,6 +30,9 @@ var (
 
 	gcsBucket = flag.String("gcs-bucket", "", "GCS Bucket to store or retrieve secret from")
 	gcsPrefix = flag.String("gcs-prefix", "", "Prefix to use when creating or reading a secret")
+
+	httpAuthToken = flag.String("http-auth-token", "", "HTTP Auth Token")
+	httpAddr      = flag.String("http-addr", ":8001", "HTTP server address to listen on")
 
 	storageClient *storage.Client
 	kmsClient     *cloudkms.KeyManagementClient
@@ -52,13 +59,22 @@ func validateFlags() error {
 		return fmt.Errorf(validationError, "-kms-key-ring")
 	case getFromEnv(kmsKey, "GCS_SECRETS_KMS_KEY"):
 		return fmt.Errorf(validationError, "-kms-key")
-	case getFromEnv(gcsBucket, "GCS_SECRETS_GCS_BUSKET"):
+	case getFromEnv(gcsBucket, "GCS_SECRETS_GCS_BUCKET"):
 		return fmt.Errorf(validationError, "-gcs-bucket")
 	case getFromEnv(gcsPrefix, "GCS_SECRETS_GCS_PREFIX"):
 		return fmt.Errorf(validationError, "-gcs-prefix")
+	case getFromEnv(httpAuthToken, "GCS_SECRETS_HTTP_AUTH_TOKEN"):
+		return nil
+	case getFromEnv(httpAddr, "GCS_SECRETS_HTTP_SERVER_ADDRESS"):
+		return nil
 	}
 	return nil
 }
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
 func main() {
 	flag.Parse()
 
@@ -69,7 +85,7 @@ func main() {
 
 	cmd := args[0]
 	switch cmd {
-	case "get", "create", "list":
+	case "get", "create", "list", "http":
 		// Expected commands
 	default:
 		log.Fatalf("unexpected command %s", cmd)
@@ -91,9 +107,11 @@ func main() {
 		if len(args) != 2 {
 			log.Fatal("get requires <key>=<secret>")
 		}
-		if err := getAndDecrypt(ctx, args[1]); err != nil {
+		secret, err := getAndDecrypt(ctx, args[1])
+		if err != nil {
 			log.Fatal(err)
 		}
+		fmt.Printf("Decrypted secret is: %s\n", secret)
 	case "create":
 		if len(args) != 2 {
 			log.Fatal("create requires <key>=<secret>")
@@ -108,7 +126,15 @@ func main() {
 			log.Fatal(err)
 		}
 	case "list":
-		if err := listSecrets(ctx); err != nil {
+		secrets, err := listSecrets(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, s := range secrets {
+			fmt.Printf("%s (%s)\n", s.Name, s.Modified)
+		}
+	case "http":
+		if err := startHTTPServer(*httpAddr); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -140,17 +166,16 @@ func encryptAndWrite(ctx context.Context, key string, secret []byte) error {
 	return nil
 }
 
-func getAndDecrypt(ctx context.Context, key string) error {
+func getAndDecrypt(ctx context.Context, key string) (string, error) {
 	secret, err := getSecret(ctx, key)
 	if err != nil {
-		return fmt.Errorf("unable to get secret: %v", err)
+		return "", fmt.Errorf("unable to get secret: %v", err)
 	}
 	m, err := decrypt(ctx, secret)
 	if err != nil {
-		return fmt.Errorf("unable to decrypt secret: %v", err)
+		return "", fmt.Errorf("unable to decrypt secret: %v", err)
 	}
-	fmt.Printf("Decrypted secret is: %s\n", m)
-	return nil
+	return string(m), nil
 }
 
 func getSecret(ctx context.Context, key string) ([]byte, error) {
@@ -195,29 +220,34 @@ func writeSecret(ctx context.Context, key string, secret []byte) error {
 	return nil
 }
 
-func listSecrets(ctx context.Context) error {
+type Secret struct {
+	Name     string
+	Value    string
+	Modified time.Time
+}
+
+func listSecrets(ctx context.Context) ([]Secret, error) {
 	it := storageClient.Bucket(*gcsBucket).Objects(ctx, &storage.Query{
 		Prefix: *gcsPrefix,
 	})
-	found := 0
+	secrets := []Secret{}
 	for {
 		objAttrs, err := it.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if val, _ := objAttrs.Metadata["gcs-secrets"]; val != "true" {
 			continue
 		}
-		fmt.Printf("%s (%s)\n", objAttrs.Name, objAttrs.Updated)
-		found += 1
+		secrets = append(secrets, Secret{Name: strings.TrimPrefix(objAttrs.Name, *gcsPrefix+"/"), Modified: objAttrs.Updated})
 	}
-	if found == 0 {
-		fmt.Println("No keys found")
+	if len(secrets) == 0 {
+		return nil, errors.New("No keys found")
 	}
-	return nil
+	return secrets, nil
 }
 
 func fmtKMSKey() string {
@@ -252,4 +282,96 @@ func decrypt(ctx context.Context, secret []byte) ([]byte, error) {
 		return nil, err
 	}
 	return resp.GetPlaintext(), nil
+}
+
+type PageData struct {
+	Errors                 []error
+	Secrets                []Secret
+	SelectedSecret         Secret
+	PreviousSecretName     string
+	PreviousSecretSecret   string
+	PreviousSecretGenerate string
+}
+
+func NewPageData() *PageData {
+	pd := &PageData{Secrets: []Secret{}, Errors: []error{}}
+	return pd
+}
+
+func indexPage(w http.ResponseWriter, r *http.Request, data *PageData) {
+	tmpl := template.Must(template.ParseFiles("index.html"))
+	if data == nil {
+		data = NewPageData()
+	}
+	secrets, err := listSecrets(context.Background())
+	if err != nil {
+		data.Errors = append(data.Errors, err)
+	} else {
+		data.Secrets = secrets
+	}
+	tmpl.Execute(w, data)
+}
+
+func getSecretPage(w http.ResponseWriter, r *http.Request, secretKey string) {
+	data := NewPageData()
+	tmpl := template.Must(template.ParseFiles("secret.html"))
+	secret, err := getAndDecrypt(context.Background(), secretKey)
+	if err != nil {
+		data.Errors = append(data.Errors, err)
+	} else {
+		data.SelectedSecret = Secret{Name: secretKey, Value: secret}
+	}
+	fmt.Printf("PAGE_DATA=%#v\n", data)
+	tmpl.Execute(w, data)
+}
+
+func createSecretPage(w http.ResponseWriter, r *http.Request) {
+	name := r.FormValue("name")
+	secret := r.FormValue("secret")
+	data := NewPageData()
+	if secret == "" || name == "" {
+		data.Errors = append(data.Errors, errors.New("'name' or 'secret' were empty"))
+	} else if err := encryptAndWrite(context.Background(), name, []byte(secret)); err != nil {
+		data.Errors = append(data.Errors, err)
+	} else {
+		http.Redirect(w, r, "/?key="+name, 301)
+		return
+	}
+	data.PreviousSecretName = name
+	data.PreviousSecretSecret = secret
+	indexPage(w, r, data)
+}
+
+func startHTTPServer(addr string) error {
+	if *httpAuthToken == "" {
+		return errors.New("http-auth-token needs to be set")
+	}
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", "Basic")
+		_, auth, _ := r.BasicAuth()
+		if auth != *httpAuthToken {
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorized.\n"))
+			return
+		}
+		if keys := r.URL.Query()["key"]; len(keys) == 1 {
+			getSecretPage(w, r, keys[0])
+		} else if r.URL.Path == "/create" && r.Method == "POST" {
+			createSecretPage(w, r)
+		} else {
+			indexPage(w, r, nil)
+		}
+	})
+	log.Printf("Started http server listening on %s\n", addr)
+	return http.ListenAndServe(addr, nil)
+}
+
+var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890$%-=+")
+
+func RandStringRunes(n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return string(b)
 }
