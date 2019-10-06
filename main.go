@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,6 +20,9 @@ import (
 	"google.golang.org/api/iterator"
 	kmspb "google.golang.org/genproto/googleapis/cloud/kms/v1"
 
+	"golang.org/x/oauth2"
+	googleOAuth2 "golang.org/x/oauth2/google"
+
 	"cloud.google.com/go/storage"
 )
 
@@ -32,7 +36,11 @@ var (
 	gcsPrefix = flag.String("gcs-prefix", "", "Prefix to use when creating or reading a secret")
 
 	httpAuthToken = flag.String("http-auth-token", "", "HTTP Auth Token")
-	httpAddr      = flag.String("http-addr", ":8001", "HTTP server address to listen on")
+	httpAddr      = flag.String("http-addr", "", "HTTP server address to listen on")
+
+	googleClientID     = flag.String("google-client-id", "", "Google Client ID")
+	googleClientSecret = flag.String("google-client-secret", "", "Google Client Secret")
+	googleRedirectHost = flag.String("google-redirect-host", "", "Google Redirect Host")
 
 	storageClient *storage.Client
 	kmsClient     *cloudkms.KeyManagementClient
@@ -66,6 +74,12 @@ func validateFlags() error {
 	case getFromEnv(httpAuthToken, "GCS_SECRETS_HTTP_AUTH_TOKEN"):
 		return nil
 	case getFromEnv(httpAddr, "GCS_SECRETS_HTTP_SERVER_ADDRESS"):
+		return nil
+	case getFromEnv(googleClientID, "GCS_SECRETS_GOOGLE_CLIENT_ID"):
+		return nil
+	case getFromEnv(googleClientSecret, "GCS_SECRETS_GOOGLE_CLIENT_SECRET"):
+		return nil
+	case getFromEnv(googleRedirectHost, "GCS_SECRETS_GOOGLE_REDIRECT_HOST"):
 		return nil
 	}
 	return nil
@@ -134,7 +148,7 @@ func main() {
 			fmt.Printf("%s (%s)\n", s.Name, s.Modified)
 		}
 	case "http":
-		if err := startHTTPServer(*httpAddr); err != nil {
+		if err := startHTTPServer(*httpAddr, *googleClientID, *googleClientSecret, *googleRedirectHost); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -321,7 +335,6 @@ func getSecretPage(w http.ResponseWriter, r *http.Request, secretKey string) {
 	} else {
 		data.SelectedSecret = Secret{Name: secretKey, Value: secret}
 	}
-	fmt.Printf("PAGE_DATA=%#v\n", data)
 	tmpl.Execute(w, data)
 }
 
@@ -342,16 +355,38 @@ func createSecretPage(w http.ResponseWriter, r *http.Request) {
 	indexPage(w, r, data)
 }
 
-func startHTTPServer(addr string) error {
-	if *httpAuthToken == "" {
-		return errors.New("http-auth-token needs to be set")
+var oauth2Config *oauth2.Config
+
+func startHTTPServer(addr, googleClientID, googleClientSecret, redirectHost string) error {
+	if addr == "" {
+		return errors.New("http-addr needs to be set")
+	} else if googleClientID == "" {
+		return errors.New("google-client-id needs to be set")
+	} else if googleClientSecret == "" {
+		return errors.New("google-client-secret needs to be set")
+	} else if redirectHost == "" {
+		return errors.New("google-redirect-host needs to be set")
 	}
+	strings.TrimRight(redirectHost, "/")
+	oauth2Config = &oauth2.Config{
+		ClientID:     googleClientID,
+		ClientSecret: googleClientSecret,
+		RedirectURL:  redirectHost + "/google/callback",
+		Endpoint:     googleOAuth2.Endpoint,
+		Scopes:       []string{"email"},
+	}
+	http.HandleFunc("/google/login", loginHandler)
+	http.HandleFunc("/google/callback", callbackHandler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("WWW-Authenticate", "Basic")
 		_, auth, _ := r.BasicAuth()
 		if auth != *httpAuthToken {
 			w.WriteHeader(401)
 			w.Write([]byte("Unauthorized.\n"))
+			return
+		}
+		if !isAuthenticated(w, r) {
+			http.Redirect(w, r, "/google/login", http.StatusTemporaryRedirect)
 			return
 		}
 		if keys := r.URL.Query()["key"]; len(keys) == 1 {
@@ -362,11 +397,117 @@ func startHTTPServer(addr string) error {
 			indexPage(w, r, nil)
 		}
 	})
+
+	// Nuke all sessions every x minutes so we don't
+	// leak memory. We don't really care if this causes
+	// someone to login again since the timeout is
+	// already really low on tokens.
+	go func() {
+		ticker := time.NewTicker(time.Minute * 10)
+		for _ = range ticker.C {
+			sessions = map[string]Token{}
+		}
+	}()
+
 	log.Printf("Started http server listening on %s\n", addr)
 	return http.ListenAndServe(addr, nil)
 }
 
-var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890$%-=+")
+type Token struct {
+	Created time.Time
+	Valid   bool
+}
+
+var sessions = map[string]Token{}
+
+func isAuthenticated(w http.ResponseWriter, r *http.Request) bool {
+	val := r.URL.Query().Get("oauthtoken")
+	if val == "" {
+		v, err := r.Cookie("googleoauth")
+		if err != nil {
+			fmt.Println(err)
+			return false
+		}
+		val = v.Value
+	} else {
+		expire := time.Now().Add(5 * time.Minute)
+		cookie := http.Cookie{
+			Name:    "googleoauth",
+			Value:   val,
+			Expires: expire,
+		}
+		http.SetCookie(w, &cookie)
+	}
+	if v, ok := sessions[val]; ok && v.Valid {
+		if time.Now().Before(v.Created.Add(5 * time.Minute)) {
+			return true
+		}
+	}
+	return false
+}
+
+func callbackHandler(w http.ResponseWriter, r *http.Request) {
+	val, _ := r.Cookie("googleoauth")
+	if r.FormValue("state") != val.Value {
+		w.WriteHeader(401)
+		w.Write([]byte("Unauthorized.\n"))
+		return
+	}
+
+	token, err := oauth2Config.Exchange(context.Background(), r.FormValue("code"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	oauthAPI := "https://www.googleapis.com/oauth2/v2/userinfo?access_token="
+	resp, err := http.Get(oauthAPI + token.AccessToken)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer resp.Body.Close()
+	contents, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	userInfo := struct {
+		Email      string `json:"email"`
+		IsVerified bool   `json:"verified_email"`
+	}{}
+	if err := json.Unmarshal(contents, &userInfo); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if userInfo.Email == "pentecostjonathan@gmail.com" && userInfo.IsVerified {
+		sessions[val.Value] = Token{
+			Created: time.Now(),
+			Valid:   true,
+		}
+		http.Redirect(w, r, "/?oauthtoken="+val.Value, http.StatusTemporaryRedirect)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	val := RandStringRunes(32)
+	expire := time.Now().Add(5 * time.Minute)
+	cookie := http.Cookie{
+		Name:    "googleoauth",
+		Value:   val,
+		Expires: expire,
+	}
+	http.SetCookie(w, &cookie)
+	u := oauth2Config.AuthCodeURL(val)
+	http.Redirect(w, r, u, http.StatusTemporaryRedirect)
+}
+
+var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890$")
 
 func RandStringRunes(n int) string {
 	b := make([]rune, n)
