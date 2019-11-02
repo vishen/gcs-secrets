@@ -11,7 +11,7 @@
   <form method="POST" action="/create">
 	  <label>Name: </label><input name="name" type="text" value="{{ .PreviousSecretName }}" />
 	  </br>
-	  <label>Secret: </label><input name="secret" type="text" value="{{ .PreviousSecretSecret }}" />
+	  <label>Secret: </label><textarea rows="5" cols="20" name="secret">{{ .PreviousSecretSecret }}</textarea>
 	   | <a target="_blank" href="https://passwordsgenerator.net/"> passwordsgenerator.net</a>
 	  </br>
       <input type="submit" value="submit" />
