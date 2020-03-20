@@ -42,6 +42,8 @@ var (
 	googleClientSecret = flag.String("google-client-secret", "", "Google Client Secret")
 	googleRedirectHost = flag.String("google-redirect-host", "", "Google Redirect Host")
 
+	gmailToAuthenticate = flag.String("gmail-to-authenticate", "", "Gmail To Authenticate")
+
 	storageClient *storage.Client
 	kmsClient     *cloudkms.KeyManagementClient
 
@@ -80,6 +82,8 @@ func validateFlags() error {
 	case getFromEnv(googleClientSecret, "GCS_SECRETS_GOOGLE_CLIENT_SECRET"):
 		return nil
 	case getFromEnv(googleRedirectHost, "GCS_SECRETS_GOOGLE_REDIRECT_HOST"):
+		return nil
+	case getFromEnv(gmailToAuthenticate, "GCS_SECRETS_GMAIL_TO_AUTHENTICATE"):
 		return nil
 	}
 	return nil
@@ -240,6 +244,11 @@ type Secret struct {
 	Modified time.Time
 }
 
+func deleteSecret(ctx context.Context, key string) error {
+	objName := filepath.Join(*gcsPrefix, key)
+	return storageClient.Bucket(*gcsBucket).Object(objName).Delete(ctx)
+}
+
 func listSecrets(ctx context.Context) ([]Secret, error) {
 	it := storageClient.Bucket(*gcsBucket).Objects(ctx, &storage.Query{
 		Prefix: *gcsPrefix,
@@ -326,8 +335,10 @@ func indexPage(w http.ResponseWriter, r *http.Request, data *PageData) {
 	tmpl.Execute(w, data)
 }
 
-func getSecretPage(w http.ResponseWriter, r *http.Request, secretKey string) {
-	data := NewPageData()
+func getSecretPage(w http.ResponseWriter, r *http.Request, secretKey string, data *PageData) {
+	if data == nil {
+		data = NewPageData()
+	}
 	tmpl := template.Must(template.ParseFiles("secret.html"))
 	secret, err := getAndDecrypt(context.Background(), secretKey)
 	if err != nil {
@@ -341,18 +352,42 @@ func getSecretPage(w http.ResponseWriter, r *http.Request, secretKey string) {
 func createSecretPage(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
 	secret := r.FormValue("secret")
+	page := r.URL.Query().Get("page")
 	data := NewPageData()
 	if secret == "" || name == "" {
 		data.Errors = append(data.Errors, errors.New("'name' or 'secret' were empty"))
 	} else if err := encryptAndWrite(context.Background(), name, []byte(secret)); err != nil {
 		data.Errors = append(data.Errors, err)
 	} else {
-		http.Redirect(w, r, "/?key="+name, 301)
+		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
 		return
 	}
-	data.PreviousSecretName = name
-	data.PreviousSecretSecret = secret
-	indexPage(w, r, data)
+	if page == "secret" && len(data.Errors) > 0 {
+		getSecretPage(w, r, name, data)
+	} else {
+		data.PreviousSecretName = name
+		data.PreviousSecretSecret = secret
+		indexPage(w, r, data)
+	}
+}
+
+func deleteSecretPage(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	page := r.URL.Query().Get("page")
+	data := NewPageData()
+	if name == "" {
+		data.Errors = append(data.Errors, errors.New("'name' was empty"))
+	} else if err := deleteSecret(context.Background(), name); err != nil {
+		data.Errors = append(data.Errors, err)
+	} else {
+		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+		return
+	}
+	if page == "secret" && len(data.Errors) > 0 {
+		getSecretPage(w, r, name, data)
+	} else {
+		indexPage(w, r, data)
+	}
 }
 
 var oauth2Config *oauth2.Config
@@ -366,6 +401,8 @@ func startHTTPServer(addr, googleClientID, googleClientSecret, redirectHost stri
 		return errors.New("google-client-secret needs to be set")
 	} else if redirectHost == "" {
 		return errors.New("google-redirect-host needs to be set")
+	} else if *gmailToAuthenticate == "" {
+		return errors.New("gmail-to-authenticate needs to be set")
 	}
 	strings.TrimRight(redirectHost, "/")
 	oauth2Config = &oauth2.Config{
@@ -377,6 +414,9 @@ func startHTTPServer(addr, googleClientID, googleClientSecret, redirectHost stri
 	}
 	http.HandleFunc("/google/login", loginHandler)
 	http.HandleFunc("/google/callback", callbackHandler)
+	http.HandleFunc("/css/skeleton.css", staticFileHandler("./css/skeleton.css"))
+	http.HandleFunc("/css/normalize.css", staticFileHandler("./css/normalize.css"))
+	http.HandleFunc("/images/favicon.png", staticFileHandler("./images/favicon.png"))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("WWW-Authenticate", "Basic")
 		_, auth, _ := r.BasicAuth()
@@ -386,13 +426,18 @@ func startHTTPServer(addr, googleClientID, googleClientSecret, redirectHost stri
 			return
 		}
 		if !isAuthenticated(w, r) {
+			// TODO: Stop redirection loop for failed logins!
+			// TODO: Stop redirection loop for failed logins!
+			// TODO: Stop redirection loop for failed logins!
 			http.Redirect(w, r, "/google/login", http.StatusTemporaryRedirect)
 			return
 		}
 		if keys := r.URL.Query()["key"]; len(keys) == 1 {
-			getSecretPage(w, r, keys[0])
+			getSecretPage(w, r, keys[0], nil)
 		} else if r.URL.Path == "/create" && r.Method == "POST" {
 			createSecretPage(w, r)
+		} else if r.URL.Path == "/delete" && r.Method == "GET" {
+			deleteSecretPage(w, r)
 		} else {
 			indexPage(w, r, nil)
 		}
@@ -481,8 +526,7 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	if userInfo.Email == "pentecostjonathan@gmail.com" && userInfo.IsVerified {
+	if userInfo.Email == *gmailToAuthenticate && userInfo.IsVerified {
 		sessions[val.Value] = Token{
 			Created: time.Now(),
 			Valid:   true,
@@ -490,8 +534,7 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/?oauthtoken="+val.Value, http.StatusTemporaryRedirect)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
-
+	http.Redirect(w, r, "/?auth-failed=true", http.StatusTemporaryRedirect)
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
@@ -515,4 +558,10 @@ func RandStringRunes(n int) string {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
 	}
 	return string(b)
+}
+
+func staticFileHandler(filename string) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filename)
+	}
 }

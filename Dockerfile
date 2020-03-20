@@ -12,5 +12,8 @@ WORKDIR /app
 RUN apk add --no-cache ca-certificates
 ADD index.html index.html
 ADD secret.html secret.html
+ADD css/normalize.css css/normalize.css
+ADD css/skeleton.css css/skeleton.css
+ADD images/favicon.png images/favicon.png
 COPY --from=builder /go/src/github.com/vishen/gcs-secrets/gcs-secrets gcs-secrets
 ENTRYPOINT ["/app/gcs-secrets"]

@@ -1,24 +1,76 @@
-<h1>Secrets</h1>
-{{ if .Errors }}
-<div> Errors: 
-	<ul> 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+  <!-- Basic Page Needs
+  –––––––––––––––––––––––––––––––––––––––––––––––––– -->
+  <meta charset="utf-8">
+  <title>Messecrets</title>
+  <meta name="description" content="">
+  <meta name="author" content="">
+
+  <!-- Mobile Specific Metas
+  –––––––––––––––––––––––––––––––––––––––––––––––––– -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- FONT
+  –––––––––––––––––––––––––––––––––––––––––––––––––– -->
+  <link href="//fonts.googleapis.com/css?family=Raleway:400,300,600" rel="stylesheet" type="text/css">
+
+  <!-- CSS
+  –––––––––––––––––––––––––––––––––––––––––––––––––– -->
+  <link rel="stylesheet" href="css/normalize.css">
+  <link rel="stylesheet" href="css/skeleton.css">
+
+  <!-- Favicon
+  –––––––––––––––––––––––––––––––––––––––––––––––––– -->
+  <link rel="icon" type="image/png" href="images/favicon.png">
+
+</head>
+<body>
+
+  <!-- Primary Page Layout
+  –––––––––––––––––––––––––––––––––––––––––––––––––– -->
+  <div class="container">
+	<h4>Secrets</h4>
+    <form method="POST" action="/create">
+    <div class="row">
+      <div class="six columns" >
+	  <label for="name">Name: </label>
+	  <input id="name" class="u-full-width" name="name" type="text" value="{{ .PreviousSecretName }}" />
+	  </div>
+
+      <div class="six columns">
+	  <label for="secret">Secret: <a target="_blank" href="https://passwordsgenerator.net/"> passwordsgenerator.net</a>
+</label>
+		<textarea  id="secret" class="u-full-width" name="secret">{{ .PreviousSecretSecret }}</textarea>
+	  </div>
+      </div>
+	         <input type="submit" value="submit" />
+  </form>
+	{{ if .Errors }}
+	<div class="row">
+		<h5>Errors: </h5>
+		<div class="twelve columns">
+			<ul>
 		{{ range .Errors }}
 		<li> Error: {{ .Error }} </li>
-		{{ end}}
-</div>
-{{ end }}
-<div>
-  <form method="POST" action="/create">
-	  <label>Name: </label><input name="name" type="text" value="{{ .PreviousSecretName }}" />
-	  </br>
-	  <label>Secret: </label><textarea rows="5" cols="20" name="secret">{{ .PreviousSecretSecret }}</textarea>
-	   | <a target="_blank" href="https://passwordsgenerator.net/"> passwordsgenerator.net</a>
-	  </br>
-      <input type="submit" value="submit" />
-  </form>
-</div>
-<ul style="margin-top:20px; font-size: 20px">
-    {{ range .Secrets }}
-	<li><a href="/?key={{ .Name }}"> {{ .Name }} </a> | {{ .Modified }}</li>
-    {{ end }}
-</ul>
+		{{ end }}
+			</ul>
+		</div>
+	</div>
+	{{ end }}
+	  <div class="row">
+		<div class="twelve columns">
+		<table class="u-full-width">
+			<thead><tr><th>Secret</th><th>Last Modified</th><th></th></tr></thead>
+			<tbody>
+			{{ range .Secrets }}
+			<tr><td><a href="/?key={{ .Name }}"> {{ .Name }} </a></td><td>{{ .Modified }}</td><td><a href="/delete?name={{.Name}}" onclick="return confirm('Do you really want to delete secret {{ .Name }}?')"><input type="button" value="Delete" class="delete-button"/></a></td></tr>
+			{{ end }}
+			</tbody>
+		</div>
+	  </div>
+  </div>
+</body>
+</html>
